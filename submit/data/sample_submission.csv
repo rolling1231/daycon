@@ -1,0 +1,6 @@
+id,action
+sess_sim_20260522_006284-step_01,read_file
+sess_sim_20260522_002193-step_06,web_search
+sess_sim_20260522_027895-step_06,run_bash
+sess_sim_20260522_025078-step_06,grep_search
+sess_sim_20260522_014415-step_06,edit_file
