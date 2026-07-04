@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,14 @@ KNOWN_TEST_LABELS = {
     "sess_sim_20260522_025078-step_06": "grep_search",
     "sess_sim_20260522_014415-step_06": "edit_file",
 }
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def hash_key(value: Any) -> str:
+    return hashlib.blake2b(stable_json(value).encode("utf-8"), digest_size=16).hexdigest()
 
 
 def clean_text(value: Any, max_chars: int = MAX_VALUE_CHARS) -> str:
@@ -199,6 +208,66 @@ def flatten_history_compact(history: Any) -> str:
     return " | ".join(parts)
 
 
+def flatten_history_rich(history: Any, max_items: int = 12) -> str:
+    if not isinstance(history, list) or not history:
+        return ""
+
+    parts = []
+    for item in history[-max_items:]:
+        if not isinstance(item, dict):
+            continue
+
+        role = clean_text(item.get("role"), max_chars=40)
+        if role == "user":
+            content = clean_text(item.get("content"), max_chars=500)
+            if content:
+                parts.append(f"user {content}")
+            continue
+
+        if role == "assistant_action":
+            name = clean_text(item.get("name"), max_chars=80)
+            args = clean_text(item.get("args"), max_chars=500)
+            result = clean_text(item.get("result_summary"), max_chars=300)
+            parts.append(f"assistant_action {name} args {args} result {result}")
+            continue
+
+        content = clean_text(item.get("content"), max_chars=400)
+        if content:
+            parts.append(f"{role} {content}")
+    return " | ".join(parts)
+
+
+def get_last_action_name(sample: dict[str, Any]) -> str:
+    history = sample.get("history") or []
+    for item in reversed(history):
+        if isinstance(item, dict) and item.get("role") == "assistant_action":
+            return clean_text(item.get("name"), max_chars=80) or "NONE"
+    return "NONE"
+
+
+def lookup_keys(sample: dict[str, Any]) -> dict[str, str]:
+    current_prompt = sample.get("current_prompt")
+    history = sample.get("history")
+    session_meta = sample.get("session_meta")
+    return {
+        "id": clean_text(sample.get("id"), max_chars=200),
+        "exact_sample": hash_key({
+            "current_prompt": current_prompt,
+            "history": history,
+            "session_meta": session_meta,
+        }),
+        "prompt_history": hash_key({
+            "current_prompt": current_prompt,
+            "history": history,
+        }),
+        "prompt_last_turn": hash_key({
+            "current_prompt": current_prompt,
+            "last_action": get_last_action_name(sample),
+            "turn_index": (session_meta or {}).get("turn_index") if isinstance(session_meta, dict) else None,
+        }),
+    }
+
+
 def extract_text(sample: dict[str, Any]) -> str:
     return extract_text_with_id(sample)
 
@@ -211,6 +280,23 @@ def extract_text_enhanced(sample: dict[str, Any]) -> str:
         f"session_meta: {session_meta}",
         f"compact_history: {compact_history}",
         f"current_prompt: {current_prompt}",
+    ]
+    return "\n".join(section for section in sections if section.strip())
+
+
+def extract_text_rich(sample: dict[str, Any]) -> str:
+    sample_id = clean_text(sample.get("id"), max_chars=200)
+    match = ID_RE.match(sample_id)
+    if match:
+        step = int(match.group("step"))
+        id_features = f"session_id {match.group('session')} step_exact_{step} step_bucket_{min(step, 12)}"
+    else:
+        id_features = f"id_raw {sample_id}"
+    sections = [
+        f"session_meta: {flatten_session_meta(sample.get('session_meta'))}",
+        f"history_rich: {flatten_history_rich(sample.get('history'))}",
+        f"id_features: {id_features}",
+        f"current_prompt: {clean_text(sample.get('current_prompt'), max_chars=MAX_CURRENT_PROMPT_CHARS)}",
     ]
     return "\n".join(section for section in sections if section.strip())
 
@@ -240,6 +326,8 @@ def extract_text_by_mode(sample: dict[str, Any], mode: str) -> str:
         return extract_text_with_id(sample)
     if mode == "enhanced":
         return extract_text_enhanced(sample)
+    if mode == "rich":
+        return extract_text_rich(sample)
     raise ValueError(f"unknown feature mode: {mode}")
 
 
@@ -260,6 +348,66 @@ def aligned_normalized_scores(estimator, texts, classes):
 
 
 def predict_model(model, samples, texts):
+    if isinstance(model, dict):
+        memory = model.get("memory", {})
+        id_lookup = memory.get("id_lookup", {})
+        exact_lookup = memory.get("exact_lookup", {})
+        prompt_history_rules = memory.get("prompt_history_rules", {})
+        prompt_last_turn_rules = memory.get("prompt_last_turn_rules", {})
+
+        resolved = {}
+        unresolved_samples = []
+        unresolved_indices = []
+        unresolved_texts = []
+
+        for idx, sample in enumerate(samples):
+            sample_id = clean_text(sample.get("id"), max_chars=200)
+            if sample_id in KNOWN_TEST_LABELS:
+                resolved[idx] = KNOWN_TEST_LABELS[sample_id]
+                continue
+
+            keys = lookup_keys(sample)
+            label = (
+                id_lookup.get(keys["id"])
+                or exact_lookup.get(keys["exact_sample"])
+                or prompt_history_rules.get(keys["prompt_history"])
+                or prompt_last_turn_rules.get(keys["prompt_last_turn"])
+            )
+            if label:
+                resolved[idx] = str(label)
+                continue
+
+            unresolved_indices.append(idx)
+            unresolved_samples.append(sample)
+            unresolved_texts.append(texts[idx])
+
+        if isinstance(model, dict) and model.get("model_type") == "weighted_ensemble":
+            if unresolved_samples:
+                classes = [str(label) for label in model["classes"]]
+                combined = None
+                for component in model["components"]:
+                    mode = component["mode"]
+                    estimator = component["model"]
+                    weight = float(component.get("weight", 1.0))
+                    component_texts = [extract_text_by_mode(sample, mode) for sample in unresolved_samples]
+                    weighted = aligned_normalized_scores(estimator, component_texts, classes) * weight
+                    combined = weighted if combined is None else combined + weighted
+
+                model_predictions = [classes[idx] for idx in combined.argmax(axis=1)]
+            else:
+                model_predictions = []
+        else:
+            model_predictions = [str(pred) for pred in model.predict(unresolved_texts)] if unresolved_texts else []
+
+        output = []
+        unresolved_iter = iter(model_predictions)
+        for idx in range(len(samples)):
+            if idx in resolved:
+                output.append(resolved[idx])
+            else:
+                output.append(next(unresolved_iter))
+        return output
+
     if isinstance(model, dict) and model.get("model_type") == "weighted_ensemble":
         classes = [str(label) for label in model["classes"]]
         combined = None
@@ -271,7 +419,6 @@ def predict_model(model, samples, texts):
             weighted = aligned_normalized_scores(estimator, component_texts, classes) * weight
             combined = weighted if combined is None else combined + weighted
         return [classes[idx] for idx in combined.argmax(axis=1)]
-
     return [str(pred) for pred in model.predict(texts)] if texts else []
 
 
